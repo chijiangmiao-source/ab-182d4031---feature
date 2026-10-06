@@ -170,3 +170,52 @@ td small { color: var(--dim); }
 .chip.inv { border-color: var(--warn); }
 .chip.grant { border-color: var(--ok); }
 .chip em { color: var(--warn); font-style: normal; }
+
+/* 步骤对照 */
+#cmpStatus { margin: 6px 0 8px; min-height: 2.6em; }
+#cmpStatus.cmperr { color: var(--bad); }
+
+.cmp-controls select {
+  background: var(--panel2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 6px;
+}
+.cmplabel { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
+
+#cmpResult h3 {
+  font-size: 13px;
+  color: var(--accent);
+  text-transform: none;
+  letter-spacing: normal;
+  margin: 12px 0 6px;
+}
+
+table.cmpgrid td:first-child { color: var(--dim); width: 130px; }
+table.cmpgrid tr.cmp-changed td { color: var(--warn); font-weight: 600; }
+
+.cmp-delta { color: var(--ok); font-size: 12.5px; margin: 4px 0; }
+
+.cmpmsgs { display: flex; flex-direction: column; gap: 6px; }
+.cmpgroup {
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 12.5px;
+}
+.cmpgroup b { color: var(--accent); }
+.cmpgroup ul { margin: 4px 0 2px; padding-left: 18px; }
+.cmpgroup li { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+.cmpgroup li small { display: block; color: var(--dim); font-family: inherit; }
+
+.cmp-freeze {
+  margin-top: 10px;
+  background: rgba(255, 95, 107, 0.12);
+  border: 1px solid var(--bad);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 12.5px;
+  color: #ffd7da;
+}

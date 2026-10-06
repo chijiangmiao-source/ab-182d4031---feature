@@ -50,6 +50,17 @@
     <table id="cacheTable" class="grid"></table>
     <h2>在途消息</h2>
     <div id="inflight"></div>
+    <h2>步骤对照 <small class="hint">同一缓存线 · 先后选择两个已存在步骤</small></h2>
+    <div class="btnrow cmp-controls">
+      <label class="cmplabel">缓存线
+        <select id="cmpLine"></select>
+      </label>
+      <button id="btnCmpFrom">将当前步设为起点</button>
+      <button id="btnCmpTo">将当前步设为终点</button>
+      <button id="btnCmpClear">清除对照</button>
+    </div>
+    <div id="cmpStatus" class="hint">先在上方回放中定位步骤，再选择同一缓存线的起点与终点；对照只基于当前这次回放的快照。</div>
+    <div id="cmpResult"></div>
   </section>
 </main>
 <script src="protocol.js"></script>

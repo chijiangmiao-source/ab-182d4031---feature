@@ -18,6 +18,12 @@
   var idx = 0;
   var timer = null;
 
+  // 步骤对照状态：端点只保存 {line, step}，对照结果一律在渲染时由
+  // 当前这次回放的 steps 即时计算（不经 Worker），旧 Worker 结果与
+  // 上一轮选择都无法覆盖当前对照。
+  var cmpFrom = null;
+  var cmpTo = null;
+
   // ---------- 示例轨迹 ----------
 
   var SAMPLES = {
@@ -107,6 +113,8 @@
       steps = result.steps;
       eventsTotal = result.eventsTotal;
       idx = 0;
+      clearCompare('已导入新回放：旧对照选择已清空，请在当前快照上重新选择两个步骤');
+      populateCmpLines();
       renderEventList(result);
       renderStep();
       if (result.violation) {
@@ -263,6 +271,181 @@
     }).join(' ');
   }
 
+  // ---------- 步骤对照 ----------
+
+  function cmpLineVal() {
+    var v = parseInt($('#cmpLine').value, 10);
+    return Number.isFinite(v) ? v : 0;
+  }
+
+  function populateCmpLines() {
+    var sel = $('#cmpLine');
+    var n = steps ? steps[0].dir.length : 0;
+    sel.innerHTML = '';
+    for (var l = 0; l < n; l++) {
+      var opt = document.createElement('option');
+      opt.value = String(l);
+      opt.textContent = 'L' + l;
+      sel.appendChild(opt);
+    }
+    sel.disabled = n === 0;
+  }
+
+  // 清空对照：任何使旧快照失效的动作（重新导入/取消/清草稿）都必须调用，
+  // 旧 Worker 结果或本地草稿均不得沿用上一轮对照。
+  function clearCompare(msg) {
+    cmpFrom = null;
+    cmpTo = null;
+    renderCompare(msg || '对照已清除：请先后选择同一缓存线的起点与终点');
+  }
+
+  function setCmpStatus(t, isError) {
+    var el = $('#cmpStatus');
+    el.textContent = t;
+    el.classList.toggle('cmperr', !!isError);
+  }
+
+  function selectCmpEndpoint(which) {
+    if (!steps) {
+      setCmpStatus('尚无回放快照：请先导入事件并完成一次回放，再选择对照步骤', true);
+      return;
+    }
+    var sel = { line: cmpLineVal(), step: idx };
+    if (which === 'from') cmpFrom = sel; else cmpTo = sel;
+    recomputeCompare();
+  }
+
+  // 由当前 steps 即时计算对照；选择非法时清空已显示结果，绝不沿用上一轮。
+  function recomputeCompare() {
+    renderCmpEndpointTags();
+    if (!cmpFrom || !cmpTo) {
+      $('#cmpResult').innerHTML = '';
+      if (cmpFrom || cmpTo) {
+        setCmpStatus('已选择' + (cmpFrom ? '起点（L' + cmpFrom.line + ' 第' + cmpFrom.step + '步）' : '')
+          + (cmpTo ? '终点（L' + cmpTo.line + ' 第' + cmpTo.step + '步）' : '')
+          + '，请再选择' + (cmpFrom ? '终点' : '起点') + '以生成对照', false);
+      }
+      return;
+    }
+    var r = Protocol.compareSteps(steps, cmpFrom, cmpTo);
+    if (!r.ok) {
+      $('#cmpResult').innerHTML = '';
+      setCmpStatus('无法对照：' + r.error.message, true);
+      return;
+    }
+    renderCompareResult(r);
+  }
+
+  function renderCmpEndpointTags() {
+    var fmt = function (s) { return s ? ('L' + s.line + ' · 第 ' + s.step + ' 步') : '未选择'; };
+    $('#btnCmpFrom').textContent = '起点：' + fmt(cmpFrom);
+    $('#btnCmpTo').textContent = '终点：' + fmt(cmpTo);
+  }
+
+  function coresCsv(list) {
+    return list.length ? list.map(function (c) { return 'C' + c; }).join(', ') : '∅';
+  }
+
+  function renderCompare(intro) {
+    populateCmpLines();
+    renderCmpEndpointTags();
+    $('#cmpResult').innerHTML = '';
+    if (intro) setCmpStatus(intro, false);
+  }
+
+  function diffRow(label, from, to, changed) {
+    return '<tr' + (changed ? ' class="cmp-changed"' : '') + '><td>' + label + '</td>' +
+      '<td>' + esc(from) + '</td><td>' + esc(to) + '</td></tr>';
+  }
+
+  function fmtMsgBrief(m) {
+    if (!m) return '—';
+    var body = m.kind === 'inv'
+      ? '失效→C' + m.to + ' g' + m.gen
+      : '授权→C' + m.to + ' ' + m.grantState + ' g' + m.gen + ' d=' + m.data;
+    return 'M' + m.id + ' ' + body + (m.dupOf !== null ? '（重传自 M' + m.dupOf + '）' : '');
+  }
+
+  function fmtEventAt(ev) { return ev ? esc(fmtEvent(ev)) : '（初始状态）'; }
+
+  function renderCompareResult(r) {
+    var head = 'L' + r.line + '：第 ' + r.from.step + ' 步 → 第 ' + r.to.step + ' 步'
+      + (r.swapped ? '（选择顺序与步号相反，已按步号归一对照）' : '');
+    var warn = '';
+    if (r.violation) {
+      var v = r.violation;
+      var labels = Protocol.VIOLATION_LABELS;
+      var label = labels[v.kind] || v.kind;
+      warn = '<div class="cmp-freeze">⛔ 区间跨过首次违约步，对照止于第 ' + v.step + ' 步（' + esc(label) + '）：'
+        + esc(v.detail) + '</div>';
+    }
+    setCmpStatus(head + (r.stoppedEarly ? '；因冻结提前终止' : ''), false);
+
+    var d = r.dir;
+    var waitFrom = d.waitAcks.pendingFrom
+      ? ('等{' + coresCsv(d.waitAcks.from) + '} g' + d.waitAcks.genFrom + ' 请求者C' + d.waitAcks.requesterFrom)
+      : '无等待写入';
+    var waitTo = d.waitAcks.pendingTo
+      ? ('等{' + coresCsv(d.waitAcks.to) + '} g' + d.waitAcks.genTo + ' 请求者C' + d.waitAcks.requesterTo)
+      : '无等待写入';
+    var waitChanged = d.waitAcks.pendingFrom !== d.waitAcks.pendingTo
+      || d.waitAcks.genFrom !== d.waitAcks.genTo
+      || d.waitAcks.requesterFrom !== d.waitAcks.requesterTo
+      || d.waitAcks.added.length > 0 || d.waitAcks.removed.length > 0;
+    var shChanged = d.sharers.added.length > 0 || d.sharers.removed.length > 0;
+
+    var html = '<h3>目录稳定差异</h3>'
+      + '<table class="grid cmpgrid"><thead><tr><th>项目</th><th>起点（第' + r.from.step + '步）</th>'
+      + '<th>终点（第' + r.to.step + '步）</th></tr></thead><tbody>'
+      + diffRow('世代 gen', 'g' + d.gen.from, 'g' + d.gen.to, d.gen.changed)
+      + diffRow('等待写入', waitFrom, waitTo, waitChanged)
+      + diffRow('等待核心集合', '{' + coresCsv(d.waitAcks.from) + '}', '{' + coresCsv(d.waitAcks.to) + '}', waitChanged)
+      + diffRow('拥有者', d.owner.from === null ? '—' : 'C' + d.owner.from,
+        d.owner.to === null ? '—' : 'C' + d.owner.to, d.owner.changed)
+      + diffRow('共享者', '{' + coresCsv(d.sharers.from) + '}', '{' + coresCsv(d.sharers.to) + '}', shChanged)
+      + '</tbody></table>';
+
+    if (d.waitAcks.added.length || d.waitAcks.removed.length) {
+      html += '<p class="cmp-delta">等待集合变化：'
+        + (d.waitAcks.added.length ? '新增 {' + coresCsv(d.waitAcks.added) + '}' : '')
+        + (d.waitAcks.added.length && d.waitAcks.removed.length ? '；' : '')
+        + (d.waitAcks.removed.length ? '清空/移除 {' + coresCsv(d.waitAcks.removed) + '}' : '') + '</p>';
+    }
+    if (d.sharers.added.length || d.sharers.removed.length) {
+      html += '<p class="cmp-delta">共享者变化：'
+        + (d.sharers.added.length ? '新增 {' + coresCsv(d.sharers.added) + '}' : '')
+        + (d.sharers.added.length && d.sharers.removed.length ? '；' : '')
+        + (d.sharers.removed.length ? '移除 {' + coresCsv(d.sharers.removed) + '}' : '') + '</p>';
+    }
+
+    var M = r.messages;
+    html += '<h3>区间内在途消息变化（仅显示有变化者）</h3><div class="cmpmsgs">';
+    html += cmpMsgGroup('区间内新出现', M.added, function (x) {
+      return fmtMsgBrief(x.msg) + '<small>第 ' + x.atStep + ' 步入列在途（事件：' + fmtEventAt(x.event) + '）</small>';
+    });
+    html += cmpMsgGroup('区间内消失（已投递）', M.removed, function (x) {
+      return fmtMsgBrief(x.msg) + '<small>第 ' + x.goneStep + ' 步离开在途（事件：' + fmtEventAt(x.event) + '）</small>';
+    });
+    html += cmpMsgGroup('区间内出现并已消失', M.ephemeral, function (x) {
+      return fmtMsgBrief(x.msg) + '<small>第 ' + x.atStep + ' 步出现、第 ' + x.goneStep + ' 步已投递</small>';
+    });
+    html += cmpMsgGroup('状态/字段改变', M.changed, function (x) {
+      return 'M' + x.from.id + '：' + esc(fmtMsgBrief(x.from).replace(/^M\d+\s*/, '')) + ' → '
+        + esc(fmtMsgBrief(x.to).replace(/^M\d+\s*/, '')) + '<small>第 ' + x.atStep + ' 步改变</small>';
+    });
+    if (!M.added.length && !M.removed.length && !M.ephemeral.length && !M.changed.length) {
+      html += '<p class="dim">区间内该缓存线无在途消息变化（超时重传仅新增重传副本，不改变原消息与目录状态）。</p>';
+    }
+    html += '</div>' + warn;
+    $('#cmpResult').innerHTML = html;
+  }
+
+  function cmpMsgGroup(title, items, fn) {
+    if (!items.length) return '';
+    return '<div class="cmpgroup"><b>' + title + '（' + items.length + '）</b><ul>' +
+      items.map(function (x) { return '<li>' + fn(x) + '</li>'; }).join('') + '</ul></div>';
+  }
+
   // ---------- 回放控制 ----------
 
   function stepTo(i) {
@@ -281,6 +464,7 @@
       $('#jsonInput').value = '';
       cancelRun('本地草稿已清除');
       steps = null; $('#eventList').innerHTML = ''; renderEmptyTables(); setStepInfo();
+      clearCompare('本地草稿已清除：对照仅属于上一次回放，已一并清空');
     });
     $('#btnPrev').addEventListener('click', function () { stopPlay(); stepTo(idx - 1); });
     $('#btnNext').addEventListener('click', function () { stopPlay(); stepTo(idx + 1); });
@@ -296,7 +480,12 @@
     $('#btnCancel').addEventListener('click', function () {
       cancelRun('已取消：旧结果不会覆盖当前内容');
       steps = null; $('#eventList').innerHTML = ''; renderEmptyTables(); setStepInfo();
+      clearCompare('已取消运行：当前无回放快照，对照选择已清空');
     });
+    $('#cmpLine').addEventListener('change', recomputeCompare);
+    $('#btnCmpFrom').addEventListener('click', function () { stopPlay(); selectCmpEndpoint('from'); });
+    $('#btnCmpTo').addEventListener('click', function () { stopPlay(); selectCmpEndpoint('to'); });
+    $('#btnCmpClear').addEventListener('click', function () { clearCompare(); });
   }
 
   function renderEmptyTables() {

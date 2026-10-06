@@ -403,6 +403,160 @@
     return null;
   }
 
+  // ---------- 步骤对照（同一缓存线两个已存在快照的稳定差异） ----------
+  //
+  // 审查员发现一次写升级迟迟未闭合时，可先后选择同一缓存线的两个步骤，
+  // 直接对照两端快照，定位区间内究竟是哪条确认 / 重传 / 投递改变了写入条件：
+  //   - 目录稳定差异：世代、等待核心集合、拥有者、共享者；
+  //   - 在途消息：仅列出区间内新出现、消失、状态改变（含区间内出现并已消失）
+  //     的消息，两端均在途且未变的消息不列出；
+  //   - 若区间跨过首次违约步，对照止于该步并保留违约错误说明。
+  // 该函数只读快照、不改变任何状态；Worker 与主线程均可调用。
+
+  function cmpError(code, message) { return { ok: false, error: { code, message } }; }
+
+  function lineWait(d) {
+    if (!d.pending) return { waiting: false, requester: null, gen: null, waitAcks: [] };
+    return {
+      waiting: true,
+      requester: d.pending.requester,
+      gen: d.pending.gen,
+      waitAcks: d.pending.waitAcks.slice().sort((x, y) => x - y),
+    };
+  }
+
+  function setDelta(fromList, toList) {
+    const from = new Set(fromList);
+    return {
+      added: toList.filter((c) => !from.has(c)).sort((x, y) => x - y),
+      removed: fromList.filter((c) => !new Set(toList).has(c)).sort((x, y) => x - y),
+    };
+  }
+
+  const MSG_SIG_KEYS = ['id', 'kind', 'from', 'to', 'line', 'gen', 'grantState', 'data', 'dupOf'];
+  function msgSig(m) { return JSON.stringify(MSG_SIG_KEYS.map((k) => m[k])); }
+
+  function compareSteps(steps, fromSel, toSel) {
+    if (!Array.isArray(steps) || steps.length === 0 || !Array.isArray(steps[0].dir)) {
+      return cmpError('no-snapshots',
+        '当前回放尚无快照：请先导入事件并产生回放结果后，再先后选择同一缓存线的两个步骤进行对照');
+    }
+    if (!fromSel || typeof fromSel !== 'object' || !toSel || typeof toSel !== 'object') {
+      return cmpError('bad-selector', '对照选择无效：起点与终点均须指定 {line, step}');
+    }
+    const numLines = steps[0].dir.length;
+
+    for (const [tag, sel] of [['起点', fromSel], ['终点', toSel]]) {
+      if (!Number.isInteger(sel.line) || sel.line < 0 || sel.line >= numLines) {
+        return cmpError('line-out-of-range',
+          `${tag}缓存线 L${sel.line} 越界：当前回放共有 ${numLines} 条缓存线（L0..L${numLines - 1}），请重新选择`);
+      }
+      if (!Number.isInteger(sel.step) || sel.step < 0 || sel.step >= steps.length) {
+        return cmpError('step-out-of-range',
+          `${tag}步骤 ${sel.step} 越界：当前回放仅保留第 0..${steps.length - 1} 步快照（共 ${steps.length} 个），请重新选择`
+          + (steps[steps.length - 1].violation ? '；回放已于首次违约步冻结，其后不再产生快照' : ''));
+      }
+    }
+    if (fromSel.line !== toSel.line) {
+      return cmpError('different-line',
+        `两个步骤必须属于同一条缓存线（起点选了 L${fromSel.line}、终点选了 L${toSel.line}）：请统一缓存线后再对照`);
+    }
+
+    let a = fromSel.step;
+    let b = toSel.step;
+    let swapped = false;
+    if (a > b) { const t = a; a = b; b = t; swapped = true; } // 先后选择不强制方向，按步号归一
+    const line = fromSel.line;
+
+    // 区间止于（含）首个违约步，保留其错误说明
+    let stop = b;
+    for (let i = a + 1; i <= b; i++) {
+      if (steps[i].violation) { stop = i; break; }
+    }
+    const stopVio = steps[stop].violation ? clone(steps[stop].violation) : null;
+
+    // ----- 目录稳定差异 -----
+    const dA = steps[a].dir[line];
+    const dB = steps[stop].dir[line];
+    const wA = lineWait(dA);
+    const wB = lineWait(dB);
+    const shA = dA.sharers.slice().sort((x, y) => x - y);
+    const shB = dB.sharers.slice().sort((x, y) => x - y);
+    const dirDiff = {
+      gen: { from: dA.gen, to: dB.gen, changed: dA.gen !== dB.gen },
+      waitAcks: Object.assign(
+        {
+          from: wA.waitAcks, to: wB.waitAcks,
+          pendingFrom: wA.waiting, pendingTo: wB.waiting,
+          requesterFrom: wA.requester, requesterTo: wB.requester,
+          genFrom: wA.gen, genTo: wB.gen,
+        },
+        setDelta(wA.waitAcks, wB.waitAcks),
+      ),
+      owner: { from: dA.owner, to: dB.owner, changed: dA.owner !== dB.owner },
+      sharers: Object.assign({ from: shA, to: shB }, setDelta(shA, shB)),
+    };
+
+    // ----- 在途消息差异（仅限本缓存线） -----
+    const lineMsgs = (i) => steps[i].inFlight.filter((m) => m.line === line);
+    const mapA = new Map(lineMsgs(a).map((m) => [m.id, m]));
+    const mapB = new Map(lineMsgs(stop).map((m) => [m.id, m]));
+    const track = new Map(); // id -> { born, last }
+    for (let i = a; i <= stop; i++) {
+      for (const m of lineMsgs(i)) {
+        let t = track.get(m.id);
+        if (!t) { t = { born: i, last: i }; track.set(m.id, t); }
+        else t.last = i;
+      }
+    }
+
+    const added = [];
+    const removed = [];
+    const changed = [];
+    const ephemeral = [];
+    const eventAt = (i) => (steps[i].event ? clone(steps[i].event) : null);
+    const findMsg = (i, id) => steps[i].inFlight.find((m) => m.id === id && m.line === line) || null;
+
+    for (const [id, t] of track) {
+      const mA = mapA.get(id) || null;
+      const mB = mapB.get(id) || null;
+      if (mA && mB) {
+        if (msgSig(mA) !== msgSig(mB)) {
+          let atStep = stop;
+          for (let i = a + 1; i <= stop; i++) {
+            const mm = findMsg(i, id);
+            if (mm && msgSig(mm) !== msgSig(mA)) { atStep = i; break; }
+          }
+          changed.push({ id, atStep, from: clone(mA), to: clone(mB) });
+        } // 两端均在途且字段未变：稳定，不列出
+      } else if (mA && !mB) {
+        const goneStep = Math.min(t.last + 1, steps.length - 1);
+        removed.push({ id, goneStep, event: eventAt(goneStep), msg: clone(mA) });
+      } else if (!mA && mB) {
+        added.push({ id, atStep: t.born, msg: clone(mB) });
+      } else {
+        // 起点与终点都不在途、仅区间中间出现过：区间内新出现并已消失
+        const goneStep = Math.min(t.last + 1, steps.length - 1);
+        ephemeral.push({ id, atStep: t.born, goneStep, bornEvent: eventAt(t.born), goneEvent: eventAt(goneStep), msg: clone(findMsg(t.born, id)) });
+      }
+    }
+    const byId = (x, y) => x.id - y.id;
+    added.sort(byId); removed.sort(byId); changed.sort(byId); ephemeral.sort(byId);
+
+    return {
+      ok: true,
+      line,
+      swapped,
+      from: { step: a, event: eventAt(a) },
+      to: { step: stop, event: eventAt(stop) },
+      requestedTo: b,
+      stoppedEarly: stop < b,
+      violation: stopVio,
+      dir: dirDiff,
+      messages: { added, removed, changed, ephemeral },
+    };
+  }
+
   // ---------- 快照与主循环 ----------
 
   function snapshot(state, index, event, note, vio) {
@@ -453,6 +607,6 @@
 
   return {
     LIMITS, VIOLATION, VIOLATION_LABELS,
-    createState, simulate, checkConsistency, effectiveHolders,
+    createState, simulate, checkConsistency, effectiveHolders, compareSteps,
   };
 });
