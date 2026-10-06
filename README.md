@@ -45,6 +45,7 @@
 - 计算全部在 **Web Worker** 中进行；每次导入/运行分配递增令牌，**取消或重新导入后旧结果不会覆盖新内容**。
 - 导入内容存入 **localStorage 草稿**，重新打开页面即确定性重放同一份逐步证据。
 - 支持单步、整段回放、暂停、重置、取消。
+- **步骤对照**：在目录表中为同一缓存线先后选择「起点」「终点」两个步骤，显示该线目录世代、等待核心集合、拥有者与共享者的稳定差异，以及仅在区间内新出现、消失或状态改变的在途消息；较晚步骤已冻结时对照止于首个违规步骤并保留其错误说明。对照始终基于当前一次回放的快照，选择越界、跨缓存线或无快照时给出可操作提示且不沿用上一轮结果。
 
 ## 运行
 
@@ -69,7 +70,7 @@ HOST_PORT=8080 docker compose up --build --exit-code-from verify --abort-on-cont
 ## 结构
 
 ```
-app/protocol.js   协议核心（Worker 与 Node 测试共用）
+app/protocol.js   协议核心（Worker 与 Node 测试共用，含步骤对照 compareSteps）
 app/worker.js     Web Worker 入口
 app/main.js       页面逻辑（令牌防旧结果覆盖、localStorage 草稿）
 app/index.html    回放页

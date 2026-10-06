@@ -13,6 +13,9 @@
  *   - 超时重传只复制在途消息；重复投递只能回放既有动作（重新登记同世代
  *     待确认），不得产生新动作，否则按过期消息冻结；
  *   - 每步之后做全局一致性检查：重复独占者、目录与副本不一致。
+ *   - 步骤对照（compareSteps）：比较同一缓存线在两个快照之间的目录
+ *     （状态/世代/拥有者/共享者/等待集合）稳定差异与在途消息变化；
+ *     区间内若含首个违规步，对照止于该步并保留其错误说明。
  */
 (function (root, factory) {
   const api = factory();
@@ -403,6 +406,145 @@
     return null;
   }
 
+  // ---------- 步骤对照 ----------
+
+  // 在途消息的规范化视图（用于跨快照比较）
+  function normMsg(m) {
+    const out = {
+      id: m.id, kind: m.kind, to: m.to, line: m.line, gen: m.gen,
+      dupOf: m.dupOf === undefined ? null : m.dupOf,
+    };
+    if (m.kind === 'grant') { out.grantState = m.grantState; out.data = m.data; }
+    return out;
+  }
+
+  function sameCoreSet(a, b) {
+    if (a === null || b === null) return a === b;
+    if (a.length !== b.length) return false;
+    return a.every((x) => b.includes(x));
+  }
+
+  function coreSetDiff(from, to) {
+    const f = from || [];
+    const t = to || [];
+    return {
+      added: t.filter((x) => !f.includes(x)),
+      removed: f.filter((x) => !t.includes(x)),
+    };
+  }
+
+  /*
+   * 对照同一缓存线的两个快照（sel = { step, line }，先后选择顺序不限）。
+   * 成功返回 { ok:true, line, fromStep, toStep, frozen, dir, messages }；
+   * 失败返回 { ok:false, error }（可操作提示，调用方不得沿用上一轮结果）。
+   * 区间 (from, to] 内若含首个违规步，对照止于该步并保留其错误说明。
+   */
+  function compareSteps(steps, selA, selB) {
+    if (!Array.isArray(steps) || steps.length === 0 || !steps[0] || !Array.isArray(steps[0].dir)) {
+      return { ok: false, error: '尚未产生快照：请先导入事件记录并完成一次回放，再选择对照步骤' };
+    }
+    const nSteps = steps.length;
+    const nLines = steps[0].dir.length;
+    if (!selA || !Number.isInteger(selA.step) || !Number.isInteger(selA.line)
+        || !selB || !Number.isInteger(selB.step) || !Number.isInteger(selB.line)) {
+      return { ok: false, error: '对照选择无效：请在目录表中用「起点 / 终点」按钮各选一步' };
+    }
+    if (selA.line !== selB.line) {
+      return { ok: false, error: `两次选择指向不同缓存线（L${selA.line} 与 L${selB.line}）：对照须针对同一缓存线，请重新选择` };
+    }
+    const line = selA.line;
+    if (line < 0 || line >= nLines) {
+      return { ok: false, error: `缓存线 L${line} 越界：本次回放仅有 L0..L${nLines - 1}，请重新选择` };
+    }
+    if (selA.step < 0 || selA.step >= nSteps || selB.step < 0 || selB.step >= nSteps) {
+      return { ok: false, error: `步骤越界：本次回放快照为第 0..${nSteps - 1} 步，请重新选择起止步骤` };
+    }
+
+    const from = Math.min(selA.step, selB.step);
+    let to = Math.max(selA.step, selB.step);
+
+    // 较晚步骤已冻结：对照止于首个违规步骤，并保留其错误说明
+    let frozen = null;
+    for (let i = from + 1; i <= to; i++) {
+      if (steps[i].violation) {
+        frozen = { step: i, violation: clone(steps[i].violation) };
+        to = i;
+        break;
+      }
+    }
+
+    const dFrom = steps[from].dir[line];
+    const dTo = steps[to].dir[line];
+    const waitFrom = dFrom.pending ? dFrom.pending.waitAcks.slice() : null;
+    const waitTo = dTo.pending ? dTo.pending.waitAcks.slice() : null;
+
+    const dir = {
+      state: { from: dFrom.state, to: dTo.state, changed: dFrom.state !== dTo.state },
+      gen: { from: dFrom.gen, to: dTo.gen, changed: dFrom.gen !== dTo.gen },
+      owner: { from: dFrom.owner, to: dTo.owner, changed: dFrom.owner !== dTo.owner },
+      sharers: Object.assign(
+        { from: dFrom.sharers.slice(), to: dTo.sharers.slice() },
+        coreSetDiff(dFrom.sharers, dTo.sharers),
+      ),
+      waitAcks: Object.assign({ from: waitFrom, to: waitTo }, coreSetDiff(waitFrom, waitTo)),
+      pending: {
+        from: dFrom.pending ? { requester: dFrom.pending.requester, gen: dFrom.pending.gen } : null,
+        to: dTo.pending ? { requester: dTo.pending.requester, gen: dTo.pending.gen } : null,
+      },
+    };
+    dir.sharers.changed = !sameCoreSet(dir.sharers.from, dir.sharers.to);
+    dir.waitAcks.changed = !sameCoreSet(dir.waitAcks.from, dir.waitAcks.to);
+
+    // 在途消息：仅统计本缓存线；区间内新出现 / 消失 / 状态改变 / 出现又消失
+    const atFrom = new Map();
+    const atTo = new Map();
+    const span = new Map(); // id -> { msg, firstSeen, lastSeen }（区间内）
+    for (const m of steps[from].inFlight) if (m.line === line) atFrom.set(m.id, m);
+    for (const m of steps[to].inFlight) if (m.line === line) atTo.set(m.id, m);
+    for (let i = from; i <= to; i++) {
+      for (const m of steps[i].inFlight) {
+        if (m.line !== line) continue;
+        const rec = span.get(m.id);
+        if (rec) rec.lastSeen = i;
+        else span.set(m.id, { msg: m, firstSeen: i, lastSeen: i });
+      }
+    }
+    const appeared = [];
+    const disappeared = [];
+    const changed = [];
+    const transient = [];
+    for (const [id, rec] of span) {
+      const inFrom = atFrom.has(id);
+      const inTo = atTo.has(id);
+      if (inFrom && inTo) {
+        const a = normMsg(atFrom.get(id));
+        const b = normMsg(atTo.get(id));
+        if (JSON.stringify(a) !== JSON.stringify(b)) changed.push({ id, from: a, to: b });
+      } else if (!inFrom && inTo) {
+        appeared.push(Object.assign(normMsg(atTo.get(id)), { since: rec.firstSeen }));
+      } else if (inFrom && !inTo) {
+        disappeared.push(Object.assign(normMsg(atFrom.get(id)), { lastSeen: rec.lastSeen }));
+      } else {
+        transient.push(Object.assign(normMsg(rec.msg), { firstSeen: rec.firstSeen, lastSeen: rec.lastSeen }));
+      }
+    }
+    const byId = (x, y) => x.id - y.id;
+    appeared.sort(byId);
+    disappeared.sort(byId);
+    changed.sort(byId);
+    transient.sort(byId);
+
+    return {
+      ok: true,
+      line,
+      fromStep: from,
+      toStep: to,
+      frozen,
+      dir,
+      messages: { appeared, disappeared, changed, transient },
+    };
+  }
+
   // ---------- 快照与主循环 ----------
 
   function snapshot(state, index, event, note, vio) {
@@ -453,6 +595,6 @@
 
   return {
     LIMITS, VIOLATION, VIOLATION_LABELS,
-    createState, simulate, checkConsistency, effectiveHolders,
+    createState, simulate, checkConsistency, effectiveHolders, compareSteps,
   };
 });

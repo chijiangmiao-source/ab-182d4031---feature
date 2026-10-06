@@ -1,7 +1,9 @@
 /*
  * 规则测试：世代绑定的失效/确认协议。
  * 覆盖：合法重传闭合、迟到确认拒绝、重复投递回放、缺失拥有者数据、
- *       过期消息、重复独占者、目录与副本不一致、输入上限。
+ *       过期消息、重复独占者、目录与副本不一致、输入上限，
+ *       以及步骤对照（同世代确认清空等待集合、超时重传不改目录状态、
+ *       冻结区间终止、选择校验）。
  */
 'use strict';
 
@@ -389,4 +391,180 @@ test('每步快照保留目录、副本、在途消息与世代号', () => {
   assert.notEqual(a, b);
   assert.equal(a.inFlight.length, 2); // M4、M5 在途
   assert.equal(b.inFlight.length, 3); // 超时重传后 M4、M5、M6
+});
+
+// ---------- 步骤对照 ----------
+
+test('步骤对照：等待集合被同世代确认清空，写入闭合且世代稳定', () => {
+  const r = P.simulate(LEGAL_TRACE);
+  // 第 7 步：写升级发起世代 1 失效，等待 {C0,C2}；第 13 步：确认清空，写入闭合
+  const c = P.compareSteps(r.steps, { step: 7, line: 0 }, { step: 13, line: 0 });
+  assert.equal(c.ok, true);
+  assert.equal(c.line, 0);
+  assert.equal(c.fromStep, 7);
+  assert.equal(c.toStep, 13);
+  assert.equal(c.frozen, null);
+
+  // 世代稳定：同世代确认推进写入，不推进世代
+  assert.equal(c.dir.gen.from, 1);
+  assert.equal(c.dir.gen.to, 1);
+  assert.equal(c.dir.gen.changed, false);
+  // 等待核心集合 {C0,C2} → 清空（目录无等待写入）
+  assert.deepEqual(c.dir.waitAcks.from, [0, 2]);
+  assert.deepEqual(c.dir.waitAcks.to, null);
+  assert.equal(c.dir.waitAcks.changed, true);
+  assert.deepEqual(c.dir.waitAcks.added, []);
+  assert.deepEqual(c.dir.waitAcks.removed, [0, 2]);
+  // 拥有者与共享者：请求者 C1 获得独占
+  assert.equal(c.dir.owner.from, null);
+  assert.equal(c.dir.owner.to, 1);
+  assert.equal(c.dir.owner.changed, true);
+  assert.deepEqual(c.dir.sharers.from, [0, 1, 2]);
+  assert.deepEqual(c.dir.sharers.to, [1]);
+  assert.deepEqual(c.dir.sharers.removed, [0, 2]);
+  assert.equal(c.dir.state.from, 'S');
+  assert.equal(c.dir.state.to, 'E');
+  assert.equal(c.dir.pending.from.requester, 1);
+  assert.equal(c.dir.pending.to, null);
+
+  // 在途消息：M4、M5 在区间内投递消失；重传副本 M6 出现又消失（瞬态）
+  assert.deepEqual(c.messages.appeared, []);
+  assert.deepEqual(c.messages.disappeared.map((m) => m.id), [4, 5]);
+  assert.deepEqual(c.messages.changed, []);
+  assert.deepEqual(c.messages.transient.map((m) => m.id), [6]);
+  assert.equal(c.messages.transient[0].dupOf, 4);
+  assert.equal(c.messages.transient[0].firstSeen, 8);
+  assert.equal(c.messages.transient[0].lastSeen, 9);
+});
+
+test('步骤对照：超时重传只复制在途消息，目录状态不变', () => {
+  const r = P.simulate(LEGAL_TRACE);
+  // 第 7→8 步之间只有一次 timeout（M4 → M6）
+  const c = P.compareSteps(r.steps, { step: 7, line: 0 }, { step: 8, line: 0 });
+  assert.equal(c.ok, true);
+  assert.equal(c.frozen, null);
+  // 目录各项均无稳定差异
+  assert.equal(c.dir.state.changed, false);
+  assert.equal(c.dir.gen.changed, false);
+  assert.equal(c.dir.owner.changed, false);
+  assert.equal(c.dir.sharers.changed, false);
+  assert.equal(c.dir.waitAcks.changed, false);
+  assert.deepEqual(c.dir.waitAcks.from, [0, 2]);
+  assert.deepEqual(c.dir.waitAcks.to, [0, 2]);
+  // 仅新增重传副本 M6，原消息 M4、M5 不变
+  assert.deepEqual(c.messages.appeared.map((m) => m.id), [6]);
+  assert.equal(c.messages.appeared[0].kind, 'inv');
+  assert.equal(c.messages.appeared[0].to, 0);
+  assert.equal(c.messages.appeared[0].gen, 1);
+  assert.equal(c.messages.appeared[0].dupOf, 4);
+  assert.equal(c.messages.appeared[0].since, 8);
+  assert.deepEqual(c.messages.disappeared, []);
+  assert.deepEqual(c.messages.changed, []);
+  assert.deepEqual(c.messages.transient, []);
+});
+
+test('步骤对照：较晚步骤已冻结时止于首个违规步骤并保留错误说明', () => {
+  const r = P.simulate(LATE_ACK_TRACE);
+  assert.equal(r.violation.step, 12); // 回放冻结于第 12 步（迟到确认）
+  // 第 7 步：第一轮写入闭合（C1 独占）；第 12 步：第二轮写入等待中被冻结
+  const c = P.compareSteps(r.steps, { step: 7, line: 0 }, { step: 12, line: 0 });
+  assert.equal(c.ok, true);
+  assert.equal(c.toStep, 12);
+  assert.ok(c.frozen);
+  assert.equal(c.frozen.step, 12);
+  assert.equal(c.frozen.violation.kind, V.LATE_ACK);
+  assert.match(c.frozen.violation.detail, /世代 1/);
+  assert.match(c.frozen.violation.detail, /等待世代 2/);
+
+  // 稳定差异：世代推进、独占被新一轮写升级收回、等待集合重新出现
+  assert.equal(c.dir.gen.from, 1);
+  assert.equal(c.dir.gen.to, 2);
+  assert.equal(c.dir.gen.changed, true);
+  assert.equal(c.dir.owner.from, 1);
+  assert.equal(c.dir.owner.to, null);
+  assert.equal(c.dir.state.from, 'E');
+  assert.equal(c.dir.state.to, 'S');
+  assert.deepEqual(c.dir.waitAcks.from, null);
+  assert.deepEqual(c.dir.waitAcks.to, [1]);
+  assert.deepEqual(c.dir.waitAcks.added, [1]);
+  // 区间内授权 M4、失效 M5 均为出现又消失
+  assert.deepEqual(c.messages.transient.map((m) => m.id), [4, 5]);
+  assert.deepEqual(c.messages.appeared, []);
+  assert.deepEqual(c.messages.disappeared, []);
+});
+
+test('步骤对照：选择校验——越界步骤、不同缓存线、无快照均给可操作提示', () => {
+  // 尚未产生快照
+  const e0 = P.compareSteps(null, { step: 0, line: 0 }, { step: 1, line: 0 });
+  assert.equal(e0.ok, false);
+  assert.match(e0.error, /尚未产生快照/);
+  const e0b = P.compareSteps([], { step: 0, line: 0 }, { step: 1, line: 0 });
+  assert.equal(e0b.ok, false);
+  assert.match(e0b.error, /尚未产生快照/);
+
+  const r = P.simulate({
+    cores: 2,
+    lines: 2,
+    events: [
+      { type: 'read_miss', core: 0, line: 0 },
+      { type: 'read_miss', core: 0, line: 1 },
+    ],
+  });
+  // 不同缓存线
+  const e1 = P.compareSteps(r.steps, { step: 1, line: 0 }, { step: 2, line: 1 });
+  assert.equal(e1.ok, false);
+  assert.match(e1.error, /不同缓存线/);
+  // 步骤越界（含负步与超出末步）
+  const e2 = P.compareSteps(r.steps, { step: 1, line: 0 }, { step: 99, line: 0 });
+  assert.equal(e2.ok, false);
+  assert.match(e2.error, /越界/);
+  const e3 = P.compareSteps(r.steps, { step: -1, line: 0 }, { step: 1, line: 0 });
+  assert.equal(e3.ok, false);
+  assert.match(e3.error, /越界/);
+  // 缓存线越界
+  const e4 = P.compareSteps(r.steps, { step: 1, line: 5 }, { step: 2, line: 5 });
+  assert.equal(e4.ok, false);
+  assert.match(e4.error, /越界/);
+  // 选择缺失/非整数
+  const e5 = P.compareSteps(r.steps, null, { step: 1, line: 0 });
+  assert.equal(e5.ok, false);
+  const e6 = P.compareSteps(r.steps, { step: 1.5, line: 0 }, { step: 2, line: 0 });
+  assert.equal(e6.ok, false);
+});
+
+test('步骤对照：先后选择顺序不影响区间，仅统计所选缓存线', () => {
+  const r = P.simulate({
+    cores: 2,
+    lines: 2,
+    events: [
+      { type: 'read_miss', core: 0, line: 0 }, // M1 授权→L0
+      { type: 'read_miss', core: 0, line: 1 }, // M2 授权→L1
+    ],
+  });
+  // 逆序选择自动按步序排列
+  const c = P.compareSteps(r.steps, { step: 2, line: 0 }, { step: 0, line: 0 });
+  assert.equal(c.ok, true);
+  assert.equal(c.fromStep, 0);
+  assert.equal(c.toStep, 2);
+  // 仅统计 L0：M1 新出现，L1 的 M2 不计入
+  assert.deepEqual(c.messages.appeared.map((m) => m.id), [1]);
+  assert.equal(c.dir.owner.to, 0);
+  // L1 视角：M2 新出现
+  const c1 = P.compareSteps(r.steps, { step: 0, line: 1 }, { step: 2, line: 1 });
+  assert.deepEqual(c1.messages.appeared.map((m) => m.id), [2]);
+});
+
+test('步骤对照：同一步骤起止无差异', () => {
+  const r = P.simulate(LEGAL_TRACE);
+  const c = P.compareSteps(r.steps, { step: 8, line: 0 }, { step: 8, line: 0 });
+  assert.equal(c.ok, true);
+  assert.equal(c.fromStep, 8);
+  assert.equal(c.toStep, 8);
+  assert.equal(c.frozen, null);
+  assert.equal(c.dir.gen.changed, false);
+  assert.equal(c.dir.waitAcks.changed, false);
+  assert.deepEqual(c.messages.appeared, []);
+  assert.deepEqual(c.messages.disappeared, []);
+  assert.deepEqual(c.messages.changed, []);
+  assert.deepEqual(c.messages.transient, []);
 });

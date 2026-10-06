@@ -170,3 +170,39 @@ td small { color: var(--dim); }
 .chip.inv { border-color: var(--warn); }
 .chip.grant { border-color: var(--ok); }
 .chip em { color: var(--warn); font-style: normal; }
+
+/* 步骤对照 */
+.cmp-cell button { padding: 1px 7px; font-size: 11px; margin-right: 4px; }
+
+#cmpStatus { font-size: 12.5px; margin-bottom: 6px; }
+
+.cmp-hint {
+  color: var(--warn);
+  background: rgba(255, 184, 77, 0.08);
+  border: 1px solid var(--warn);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 12.5px;
+}
+
+.cmp-frozen {
+  background: rgba(255, 184, 77, 0.12);
+  border: 1px solid var(--warn);
+  color: #ffe3b3;
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  font-size: 12.5px;
+}
+
+.cmp-table { margin-bottom: 8px; }
+
+tr.cmp-changed td { background: rgba(90, 162, 255, 0.10); }
+
+.cmp-msgs h3 {
+  font-size: 12.5px;
+  margin: 8px 0 6px;
+  color: var(--dim);
+}
+
+.cmp-msgrow { margin: 4px 0; font-size: 12.5px; }
